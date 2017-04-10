@@ -1,0 +1,511 @@
+---
+title: "Bike sharing demand"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Assignments
+
+Data: Bike Sharing Dataset Data Set 
+https://archive.ics.uci.edu/ml/datasets/Bike+Sharing+Dataset
+
+File `hour.csv` from the link or from the course page.
+
+The purpose is to estimate the count of total rental bikes (cnt variable) for each hour for the remaining days of each month based on the first 20 days.
+
+Import the file as data frame.
+Explort, clean, and arrange variables (for example converting them for better readability, e.g. converting `weathersit` into a factor variable with meaningful names: "clear", "cloudy", "light rain", "heavy rain").
+
+Constraints: final model will be based on `lm()`, with a formula of the type: `cnt ~ ...` (you have to choose the predictors).
+Ridge and Lasso techniques can be used to improve the selection of the predictors.
+
+Assume you have been given only the first 20 days of each month.
+You will build and validate your model on this data to deliver the final model.
+You will use the testing data (remaining days of the months) only to assess the performance of the model, but you cannot use this information as a feedback for the construction of the model.
+
+* You will deliver a **GAM** model with `gam()` that incorporates a a spline modeling for `hour` through a term of the form `s(hour,...)` or `te()`.
+* You will deliver a **Tree based** model with a choice between Random Forest `randomForest()` and Boosted Tree model with `gbm()`; the model has to incorporate the predictor `hour`.
+* You will consider daily curves for `count`, define a distance metric between daily curves and perform clustering to infer the number and type of typical daily profiles; you will assess if the separation in two classes would match the separation between working and non-working days (giving the prediction accuracy).
+* You will submit the extended version of this `Rmd` file, which should compile smoothly (assume the file `hour.csv` is located in the same folder of this script).
+
+
+
+##Loading and cleaning data
+```{r}
+
+if("pacman" %in% rownames(installed.packages()) == FALSE) {install.packages("pacman")}
+library(pacman)
+p_load(dplyr, lubridate, ggplot2)
+p_load(ISLR)
+p_load(glmnet)
+p_load(leaps)
+p_load(randomForest)
+p_load(splines)
+p_load(TSClust)
+
+library(tree)
+library(caret)
+
+# Chargement du package gridExtra
+if(!require("gridExtra")){
+  install.packages("gridExtra")
+  require("gridExtra")
+}
+
+if("mgcv" %in% rownames(installed.packages()) == FALSE) {install.packages("mgcv")}
+library(mgcv)
+library(gbm)
+
+data.orig.df = read.csv('hour.csv', header = TRUE, as.is = TRUE) # as.is = TRUE allows to keep characters for parsing 
+str(data.orig.df)
+
+data.df = tbl_df(data.orig.df)
+data.df = data.df %>%
+  mutate(at = ymd_h(paste(dteday, hr))) %>% # parse into time object
+  mutate(day = mday(at)) %>% # get day of the month
+  mutate(season = factor(season, labels = c("spring", "summer", "fall", "winter"))) %>% # convert int to more readable factor
+  rename(year = yr) %>%
+  rename(month = mnth) %>%
+  rename(hour = hr) %>%
+  rename(humidity = hum) %>%
+  rename(weather = weathersit) %>%
+  mutate(holiday = as.logical(holiday)) %>%
+  mutate(temperatureTrue = temp*(39+8)+8) %>% # conversion to original values according to documentation
+  mutate(temperatureFelt = temp*(50+16)+16) %>% # conversion to original values according to documentation
+  mutate(workingDay = as.logical(workingday)) %>%
+  rename(count = cnt) %>%
+  mutate(weather = factor(weather, labels = c("very good", "good", "fair", "bad"))) %>% # convert int to more readable factor
+  select(at, year, month, day, hour, weather, temperatureTrue, temperatureFelt, humidity, windspeed, holiday, workingDay, season, count) # arrange and select columns
+str(data.df)
+
+
+data.train.df = data.df %>% filter(day <= 20)
+data.test.df = data.df %>% filter(day > 20)
+
+summary(data.train.df)
+```
+
+##First observation on data
+
+First, we draw graphs for each months, using count, humidity, true temperature, felt temperature and windspeed as parameters. Then we  plot bar charts for holidays, weather and working day parameters. The goal is to have an idea of wich parameters would be important or not. 
+````{r}
+for(j in 0:1){
+  for(i in 1:12){
+    data.subset.df = subset(data.train.df, as.numeric(year)==j & as.numeric(month)==i)
+  print( ggplot(data = data.subset.df) +
+                geom_line(aes(x = at, y = count, colour="count", group="legend")) +
+                geom_line(aes(x = at, y = humidity*100, colour="humidity", group="legend")) +
+                geom_line(aes(x = at, y = temperatureTrue, colour="temperature", group="legend")) +
+                geom_line(aes(x = at, y = temperatureFelt, colour="temperatreFelt", group="legend")) +
+                geom_line(aes(x = at, y = windspeed, colour="winspeed", group="legend")) +
+                ggtitle(format(data.subset.df$at, format="%B")) +
+                scale_colour_brewer(palette="Paired"))
+  }
+}
+
+ggplot(data = data.train.df) +
+                geom_bar(aes(x = holiday, weight=count), fill="#56B4E9", colour="black")
+ggplot(data = data.train.df) +
+                geom_bar(aes(x = weather, weight=count), fill="#56B4E9", colour="black")
+ggplot(data = data.train.df) +
+                geom_bar(aes(x = season, weight=count), fill="#56B4E9", colour="black")
+ggplot(data = data.train.df) +
+                geom_bar(aes(x = workingDay, weight=count), fill="#56B4E9", colour="black")
+
+
+```
+
+First, we can observe some trends:
+  * holiday is a key parameter: during holidays, there is a few counts
+  * same thing for working day, there is more counts during a working day
+  * month is a key parameter: during the period between may and october, there is more counts
+  * weather influates on counts: more counts on very good and days
+  * season can have an effect
+  * true temperature, felt temperature and windspeed can have an impact on counts but we can't be sure just by watching graphs
+
+##  First model
+
+Using observations we made in First observation part, we try to find a model using parameters year, month, day, hour, weather, temperatureFelt, temperatureTrue, windspeed, humidity, holiday and workingDay.
+```{r}
+data.train.df = na.omit(data.train.df)
+data.firstmodel <- lm(count ~ year+month+day+hour+weather+temperatureFelt+temperatureTrue+windspeed+humidity+holiday+workingDay+season, data=data.train.df)
+
+data.train.df$predCount <- predict(data.firstmodel, newdata = data.train.df)
+
+rss = sum((data.train.df$count - data.train.df$predCount)^2)
+rss
+
+mse = mean((data.train.df$count - data.train.df$predCount)^2)
+mse
+
+data.train.df$predCount[data.train.df$predCount<0] <- 0
+rmsle = mean((log(data.train.df$count+1) - log(data.train.df$predCount+1))^2)
+rmsle
+
+```
+
+Our MSE and RSS is really big, let's try to plot our prediction and count to see how the model fit the curve.
+
+**We remove the plot part (which was one first TP) because of the number of computed models**
+
+The result isn't satifaying, we'll try to improve it.
+
+##Ridge regression
+
+We'll use the ridge regression method to try to find a better model for count function. 
+This method goal is to have a small RSS.
+
+```{r}
+data.train.df <- subset(data.train.df, select=c("at", "year", "month", "day", "hour", "weather", "temperatureTrue", "temperatureFelt", "humidity", "windspeed", "holiday", "workingDay", "season", "count"))
+
+data.train.df = na.omit(data.train.df)
+grid = 10^seq(10, -2, length = 100)
+
+x = model.matrix(count ~ ., data.train.df)[,-1] # there is no intercept term in the objective function
+y = data.train.df$count
+
+ridge.mod = glmnet(x, y, alpha = 0, lambda = grid)
+
+dim(coef(ridge.mod))
+
+plot.glmnet(ridge.mod, xvar = "lambda")
+
+predict(ridge.mod, s = 50, type = "coefficients")[1:18,]
+
+set.seed(1)
+train = sample(c(TRUE,FALSE), nrow(x), rep = TRUE)
+test = (!train)
+set.seed(1)
+train = sample(1:nrow(x), nrow(x)/2)
+test = (-train)
+y.test = y[test]
+
+plot.glmnet(ridge.mod, xvar = "lambda")
+
+set.seed(1)
+cv.out = cv.glmnet(x[train,], y[train], alpha = 0)
+bestlam = cv.out$lambda.min
+bestlam
+
+ridge.pred = predict(ridge.mod, s = bestlam, newx = x[test,])
+mean((ridge.pred - y.test)^2)
+
+out = glmnet(x, y, alpha = 0)
+predict(out, type = "coefficients", s = bestlam)[1:18,]
+
+ridge.pred = predict(ridge.mod, s = 0, newx = x[test,], exact = T)
+mean((ridge.pred-y.test)^2)
+lm(y~x, subset=train)
+predict(ridge.mod, s = 0, exact = T, type = "coefficients")[1:18,]
+
+```
+
+We can see that our model will have 13 parameters: at, year, month, day, hour, weather, temperatureTrue, temperatureFelt, windspeed, humidity, holiday, season and workingday. We can calculate the RSS and MSE:
+
+```{r}
+data.model.ridge <- lm(count ~ at + year + month + day + hour + weather + temperatureTrue + temperatureFelt + windspeed + humidity +holiday + workingDay + season, data=data.train.df)
+
+data.train.df$predCount <- predict(data.model.ridge, newdata = data.train.df)
+
+rssRidge = sum((data.train.df$count - data.train.df$predCount)^2)
+rssRidge
+
+mseRidge = mean((data.train.df$count - data.train.df$predCount)^2)
+mseRidge
+
+data.train.df$predCount[data.train.df$predCount<0] <- 0
+rmsleRidge = mean((log(data.train.df$count+1) - log(data.train.df$predCount+1))^2)
+rmsleRidge
+
+```
+
+We can see that our RSS and MSE is really big.
+**We remove the plot part (which was one first TP) because of the number of computed models**
+We try to plot the prediction of count and the real count to see if our model fit the count curve.
+
+
+We can see that our prediction doesn't fit well our count curve. We'll try to have a best model with the lasso method.
+
+
+##Lasso
+
+Lasso methods permits to find a model which fits the curve with less parameters than ridge regression.
+
+```{r}
+data.train.df <- subset(data.train.df, select=c("at", "year", "month", "day", "hour", "weather", "temperatureTrue", "temperatureFelt", "humidity", "windspeed", "holiday", "workingDay", "season", "count"))
+data.train.df = na.omit(data.train.df)
+grid = 10^seq(10, -2, length = 100)
+x = model.matrix(count ~ ., data.train.df)[,-1] # there is no intercept term in the objective function
+y = data.train.df$count
+
+lasso.mod = glmnet(x[train,], y[train], alpha = 1, lambda = grid)
+plot(lasso.mod)
+
+set.seed(1)
+cv.out = cv.glmnet(x[train,], y[train], alpha = 1)
+plot(cv.out)
+bestlam = cv.out$lambda.min
+lasso.pred = predict(lasso.mod, s = bestlam, newx = x[test,])
+
+out = glmnet(x, y, alpha = 1, lambda = grid)
+lasso.coef = predict(out, type = "coefficients", s = bestlam)[1:18,]
+lasso.coef
+lasso.coef[lasso.coef != 0]
+```
+
+We can see that we only have 10 parameters. We compute RSS and MSE
+
+
+```{r}
+data.model.lasso <- lm(count ~ at + month + day + hour + weather + temperatureTrue + humidity + windspeed +holiday + season, data = data.train.df)
+data.train.df$predCount <- predict(data.model.lasso, newdata = data.train.df)
+
+rssLasso = sum((data.train.df$count - data.train.df$predCount)^2)
+rssLasso
+
+mseLasso = mean((data.train.df$count - data.train.df$predCount)^2)
+mseLasso
+
+data.train.df$predCount[data.train.df$predCount<0] <- 0
+rmsleLasso = mean((log(data.train.df$count+1) - log(data.train.df$predCount+1))^2)
+rmsleLasso
+
+```
+
+We still have a big RSS and MSE. We plot the perdiction count and the real count to see if the prediction fits the curve:
+**We remove the plot part (which was one first TP) because of the number of computed models**
+
+### GAMs
+
+We use a GAM algorith to try to fit our dataset with a non-linear model: the GAM function permits to aggregate spline and linear terms. Here, we will try 4 models: 
+1- all terms are linear spline
+1.2 - with the summary on the model 1, we affine the model
+2- all terms are cubic spline
+2.2 - with the summary on the model 2, we affine the model
+3- all terms are natural spline
+3.2 - with the summary on the model 3, we affine the model
+
+```{r, echo=FALSE}
+options(warn=-1)
+data.train.df <- subset(data.train.df, select=c("at", "year", "month", "day", "hour", "weather", "temperatureTrue", "temperatureFelt", "humidity", "windspeed", "holiday", "workingDay", "season", "count"))
+data.train.df = na.omit(data.train.df)
+
+gam1 = gam(count ~ s(hour+day+month+temperatureTrue+temperatureFelt+humidity+windspeed), data = data.train.df)
+gam1$converged
+summary(gam1)
+
+gam12 = gam(count ~ s(hour,month,humidity,windspeed)+day+temperatureTrue+temperatureFelt, data = data.train.df)
+gam12$converged
+summary(gam12)
+
+gam2 = gam(count ~ bs(hour + day + month+ temperatureTrue+ temperatureFelt+ humidity+ windspeed), data = data.train.df)
+gam2$converged
+summary(gam2)
+
+gam22 = gam(count ~ bs(hour+ month+ temperatureTrue+ temperatureFelt+ humidity)+ windspeed+day, data = data.train.df)
+gam22$converged
+summary(gam22)
+
+gam3 = gam(count ~ ns(hour+ day+ month+ temperatureTrue+ temperatureFelt+ humidity+ windspeed), data = data.train.df)
+gam3$converged
+summary(gam3)
+
+gam32 = gam(count ~ ns(hour+ day+ temperatureTrue+ temperatureFelt+ humidity)+month+windspeed, data = data.train.df)
+gam32$converged
+summary(gam32)
+
+gam42 = gam(count ~ te(hour, month, humidity, windspeed)+day+temperatureTrue+temperatureFelt, data = data.train.df)
+gam42$converged
+summary(gam42)
+
+```
+
+We compare 7 gam models, and we see that the model 1 has the higher R squared adjusted. So we select this model: 
+
+```{r}
+
+data.train.df$predCountGam <- predict(gam12, newdata = data.train.df)
+
+data.train.df$predCountGam[data.train.df$predCountGam < 0] <- 0
+
+rmsleGam = mean((log(data.train.df$count+1) - log(data.train.df$predCountGam+1))^2)
+rmsleGam
+
+```
+
+```{r}
+
+rssGam = sum((data.train.df$count - data.train.df$predCountGam)^2)
+rssGam
+
+mseGam = mean((data.train.df$count - data.train.df$predCountGam)^2)
+mseGam
+
+```
+
+### Trees/Forests
+
+First, we choose to use the random forest method.
+
+The goal is to find the best value for mtry, so wwe are going to iterate over all possible values of mtry and plot the OOB and test errors:
+
+```{r}
+
+data.train.df <- subset(data.train.df, select=c("at", "year", "month", "day", "hour", "weather", "temperatureTrue", "temperatureFelt", "humidity", "windspeed", "holiday", "workingDay", "season", "count"))
+data.train.df = na.omit(data.train.df)
+
+set.seed(1)
+train = sample(1:nrow(data.train.df), 300)
+test = setdiff(1:nrow(data.train.df), train)
+
+oob.err = double(13)
+test.err = double(13)
+for (mtry in 1:13) {
+  set.seed(1)
+  fit = randomForest(count ~ ., data = data.train.df, subset = train, mtry = mtry, ntrees = 400)
+  oob.err[mtry] = fit$mse[400]
+  pred = predict(fit, data.train.df[test,])
+  test.err[mtry] = with(data.train.df[test,], mean((count - pred)^2))
+  cat(mtry, " ")
+}
+
+matplot(1:mtry, cbind(test.err, oob.err), pch = 19, col = c("red", "blue"), type = "b", ylab = "Mean Squared Error")
+legend("topright", legend = c("Test", "OOB"), pch = 19, col = c("red", "blue"))
+```
+
+We want to take the best model: the one with the lowest test error. Then we compute the rmsle:
+
+```{r}
+
+mtry.min = which.min(test.err)
+set.seed(1)
+rf.data.train = randomForest(count ~ ., data = data.train.df, subset = train, mtry = mtry.min, importance = TRUE)
+
+predCountTree = predict(rf.data.train, newdata = data.train.df[test,])
+predCountTree[predCountTree<0] <- 0
+rmsleTree = mean((log(data.train.df[test,]$count+1) - log(predCountTree +1))^2)
+rmsleTree
+```
+
+We can see that the rmsle of the random forest method is very small ! We can go further and see the most pure and important variables:
+
+```{r, echo=FALSE}
+
+importance(rf.data.train)
+
+varImpPlot(rf.data.train)
+
+```
+
+We can see that hour and at parameters are the most pure and important one.
+
+Now we use boosting:
+
+
+```{r}
+
+data.train.df <- subset(data.train.df, select=c("at", "year", "month", "day", "hour", "weather", "temperatureTrue", "temperatureFelt", "humidity", "windspeed", "holiday", "workingDay", "season", "count"))
+data.train.df = na.omit(data.train.df)
+
+set.seed(1)
+train = sample(1:nrow(data.train.df), 300)
+test = setdiff(1:nrow(data.train.df), train)
+
+boostmodel = gbm(count ~ . -at-holiday-workingDay, data = data.train.df[train,], distribution = "gaussian", n.trees = 5000, interaction.depth = 4, shrinkage = 0.2, verbose = F)
+summary(boostmodel)
+
+predBoost = predict(boostmodel, newdata = data.train.df[test,], n.trees = 5000)
+mean((predBoost - data.train.df[test,]$count)^2)
+```
+
+We play with lambda attribute and depth to find the best model:
+
+```{r}
+
+boostmodel = gbm(count ~ . -at-holiday-workingDay, data = data.train.df[train,], distribution = "gaussian", n.trees = 5000, interaction.depth = 3, shrinkage = 0.0022, verbose = F)
+summary(boostmodel)
+
+predBoost = predict(boostmodel, newdata = data.train.df[test,], n.trees = 5000)
+mean((predBoost - data.train.df[test,]$count)^2)
+```
+
+We want to take the best model: the one with the lowest test error. Then we compute the rmsle:
+
+```{r}
+
+predBoost[predBoost<0] <- 0
+rmsleBoost = mean((log(data.train.df[test,]$count+1) - log(predBoost +1))^2)
+rmsleBoost
+
+```
+
+We can see that the rmsle of the boosting method is also very small ! We can go further and see the most important variables: hour, temperatureTrue and year.
+
+
+```{r}
+
+rmsleBoost
+rmsleTree
+
+```
+ 
+ The lowest rmsle is the Random Forest one, so we keep this model.
+
+```{r}
+data.train.df$predCountTree = predict(rf.data.train, newdata = data.train.df)
+data.train.df$predCountTree[data.train.df$predCountTree<0] <- 0
+```
+
+### Considerations
+
+*Compare the performances of the three models examined: the linear regression (previous homework), the GAM model, and the Tree based model*
+
+So we can compare RMLSE find for each model:
+
+```{r}
+rmsle
+rmsleRidge
+rmsleLasso
+rmsleGam
+rmsleTree
+```
+
+We can see that the rmsleTree is the lower, so we'll use the lasso model for our prediction.
+We plot the prediction for the 10 remaining days (data.test.df).
+
+```{r}
+data.test.df$predCount <- predict(rf.data.train, newdata = data.test.df)
+data.test.df$predCount[data.test.df$predCount<0] <- 0
+```
+
+```{r}
+for(j in 0:1){
+  for(i in 1:12){
+data.subset.df = subset(data.test.df, as.numeric(year)==j & as.numeric(month)==i)
+  print( ggplot(data = data.subset.df)
+        + geom_line(aes(y=predCount, x=at, colour="prediction for count", group="legend"))
+        + ggtitle(format(data.subset.df$at, format="%B")) 
+        + scale_colour_brewer(palette="Paired"))
+  }
+}
+```
+
+## Clustering on daily profiles for `count`
+
+*The simplest way to compute distances between daily curves is to perform a simple Euclidian distance (sum of hour by hour differences); you can use the package `TSClust` for dissimilarity computation and clustering.*
+
+We will use k-mean clustering with Euclidian distance to make clustering.
+
+
+```{r}
+whichCluster = sample(1:2, size = length(data.train.df), replace = TRUE)
+km.out = kmeans(dist(data.train.df$hour), centers = 2, nstart = 20) #nstart = random starts
+
+plot(data.train.df$workingDay, col = km.out$cluster, pch = 1, cex = 2, lwd = 2)
+points(data.train.df$workingDay, col = c(2,1)[whichCluster], pch = 19)
+```
+
+We can see that clusters are not dependant from the workingDay parameter because there is point in red and in black for each value of workingDay.
